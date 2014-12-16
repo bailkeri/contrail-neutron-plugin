@@ -11,7 +11,7 @@ import neutron.services.loadbalancer.drivers.abstract_driver as abstract_driver
 from vnc_api.vnc_api import ServiceInstance, ServiceInstanceType
 from vnc_api.vnc_api import ServiceScaleOutType, ServiceInstanceInterfaceType
 from vnc_api.vnc_api import NoIdError, RefsExistError
-import utils
+import neutron_plugin_contrail.plugins.opencontrail.loadbalancer.utils
 
 LOG = logging.getLogger(__name__)
 
@@ -23,9 +23,8 @@ LOADBALANCER_SERVICE_TEMPLATE = [
 
 class OpencontrailLoadbalancerDriver(
         abstract_driver.LoadBalancerAbstractDriver):
-    def __init__(self, plugin):
-        self.plugin = plugin
-        self._api = plugin.get_api_client()
+    def __init__(self, manager, api, args=None):
+        self._api = api
         self._lb_template = None
 
     def _get_template(self):
