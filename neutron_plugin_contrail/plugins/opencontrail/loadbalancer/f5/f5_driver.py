@@ -12,6 +12,7 @@ from neutron.openstack.common import log as logging
 import neutron.services.loadbalancer.drivers.abstract_driver as abstract_driver
 
 from cfgm_common.zkclient import ZookeeperClient,IndexAllocator
+from cfgm_common import exceptions as vnc_exc
 from vnc_api.vnc_api import *
 import neutron_plugin_contrail.plugins.opencontrail.loadbalancer.utils as utils
 from f5.bigip import bigip as f5_bigip
@@ -32,6 +33,9 @@ class OpencontrailF5LoadbalancerDriver(
     # BIG-IP containers
     __bigips = {}
     __traffic_groups = []
+    ifl_list = {}
+    subnet_snat_list = {}
+    project_list = {}
     def fill_config_options(self, config_section):
         # F5 Loadbalancer config options
         f5opts = {
@@ -116,8 +120,7 @@ class OpencontrailF5LoadbalancerDriver(
         interface_name = physical_interface.get_fq_name_str()+'_'+str(vlan_tag)
         try:
             mx_logical_interface = self._api.logical_interface_read(fq_name_str=interface_name)
-        except Exception as e:
-            print str(e)
+        except vnc_exc.NoIdError:
             mx_logical_interface = LogicalInterface(interface_name.split(':')[-1], 
                                     physical_interface, vlan_tag)
             mx_logical_interface.uuid = str(uuid.uuid4())
@@ -130,7 +133,7 @@ class OpencontrailF5LoadbalancerDriver(
         interface_name = self.mx_physical_router.get_fq_name_str()+':'+physical_interface
         try:
             mx_physical_interface = self._api.physical_interface_read(fq_name_str=interface_name)
-        except NoIdError:
+        except vnc_exc.NoIdError:
             mx_physical_interface = PhysicalInterface(physical_interface, self.mx_physical_router)
             mx_physical_interface.uuid = str(uuid.uuid4())
             mx_physical_interface_id = self._api.physical_interface_create(mx_physical_interface)
@@ -141,7 +144,7 @@ class OpencontrailF5LoadbalancerDriver(
     def create_physical_router(self, router_name, router_ip):
         try:
             physical_router = self._api.physical_router_read(fq_name_str=router_name)
-        except NoIdError:
+        except vnc_exc.NoIdError:
             physical_router = PhysicalRouter(router_name.split(':')[1], physical_router_management_ip = router_ip,
                                             physical_router_dataplane_ip = router_ip)
             physical_router.uuid = str(uuid.uuid4())
@@ -413,15 +416,6 @@ class OpencontrailF5LoadbalancerDriver(
         # Delete VIP related config
         bigip_vs = bigip.virtual_server
         bigip_vs.delete(name=pool_info['virtual_ip'], folder=pool_info['tenant_id'])
-        # VLAN and SNAT delete is conditional TODO
-        for snat_ip in pool_info['vip']['snat_vmi'].keys() or []:
-            self.delete_snat(bigip, pool_info['tenant_id'], pool_info['tenant_id'], 
-                             pool_info['vip']['snat_vmi'][snat_ip][0])
-
-        self.delete_vlan_interface(bigip, pool_info['tenant_id'], 
-                                   str(pool_info['vip']['vlan_tag']), 
-                                   pool_info['vip']['self_ip'][0])
-
     # end delete_vip_service
 
     def delete_service_on_device(self, bigip, pool_info):
@@ -431,14 +425,6 @@ class OpencontrailF5LoadbalancerDriver(
         # Delete the Pool config
         bigip.pool.delete(name=pool_info['id'],
                               folder=pool_info['tenant_id'])
-        # VLAN and SNAT delete is conditional TODO
-        for snat_ip in pool_info['snat_vmi'].keys() or []:
-            self.delete_snat(bigip, pool_info['tenant_id'], pool_info['tenant_id'], 
-                             pool_info['snat_vmi'][snat_ip][0])
-
-        self.delete_vlan_interface(bigip, pool_info['tenant_id'], 
-                                   str(pool_info['vlan_tag']), 
-                                   pool_info['self_ip'][0])
     # end delete_service_on_device
 
     def delete_vlan_interface(self, bigip, tenant_id, vlan_name, self_ip_name):
@@ -531,42 +517,100 @@ class OpencontrailF5LoadbalancerDriver(
     # end create_service_on_device
 
     def release_pool_resource(self, pool_info):
-        # Release the VLAN 
-        self.free_vlan(pool_info['vlan_tag'])
+        ifl_uuid = pool_info[u'mx_ifl']
+        if ifl_uuid not in self.ifl_list:
+            return
+        self.ifl_list[ifl_uuid].remove(pool_info['id'])
 
-        # delete the IFL
-        self._api.logical_interface_delete(id=pool_info[u'mx_ifl'])
+        if not len(self.ifl_list[ifl_uuid]):
+            bigips = self.__bigips.values()
+            for set_bigip in bigips:
+                # Delete POOL selfip
+                self.delete_vlan_interface(set_bigip, pool_info['tenant_id'], 
+                                   str(pool_info['vlan_tag']), 
+                                   pool_info['self_ip'][0])
+            # Release the VLAN 
+            self.free_vlan(pool_info['vlan_tag'])
 
-        vmi = VirtualMachineInterfaceSM.get(pool_info[u'self_ip'][2])
-        self._api.instance_ip_delete(id=vmi.instance_ip)
-        self._api.virtual_machine_interface_delete(id=pool_info[u'self_ip'][2])
-        for snat_ip in pool_info['snat_vmi'].keys() or []:
-            vmi = VirtualMachineInterfaceSM.get(pool_info['snat_vmi'][snat_ip][1])
+            # delete the IFL
+            self._api.logical_interface_delete(id=pool_info[u'mx_ifl'])
+
+            vmi = VirtualMachineInterfaceSM.get(pool_info[u'self_ip'][2])
             self._api.instance_ip_delete(id=vmi.instance_ip)
-            self._api.virtual_machine_interface_delete(id=pool_info['snat_vmi'][snat_ip][1])
+            self._api.virtual_machine_interface_delete(id=pool_info[u'self_ip'][2])
+            del(self.ifl_list[ifl_uuid])
+
+        subnet_id = pool_info[u'subnet']
+        if subnet_id not in self.subnet_snat_list:
+            return
+        self.subnet_snat_list[subnet_id]['id'].remove(pool_info['id'])
+        if not len(self.subnet_snat_list[subnet_id]['id']):
+            del(self.subnet_snat_list[subnet_id])
+            for snat_ip in pool_info['snat_vmi'].keys() or []:
+                vmi = VirtualMachineInterfaceSM.get(pool_info['snat_vmi'][snat_ip][1])
+                self._api.instance_ip_delete(id=vmi.instance_ip)
+                self._api.virtual_machine_interface_delete(id=pool_info['snat_vmi'][snat_ip][1])
+                bigips = self.__bigips.values()
+                for set_bigip in bigips:
+                    self.delete_snat(set_bigip, pool_info['tenant_id'], pool_info['tenant_id'], 
+                             pool_info['snat_vmi'][snat_ip][0])
+
     # end release_pool_resource
 
     def release_vip_resource(self, pool_info):
-        # Release the VLAN 
-        self.free_vlan(pool_info['vip']['vlan_tag'])
+        ifl_uuid = pool_info['vip'][u'mx_ifl']
+        if ifl_uuid not in self.ifl_list:
+            return
+        self.ifl_list[ifl_uuid].remove(pool_info['vip']['id'])
+        if not len(self.ifl_list[ifl_uuid]):
+            bigips = self.__bigips.values()
+            for set_bigip in bigips:
+                # Delete VIP selfip
+                self.delete_vlan_interface(set_bigip, pool_info['tenant_id'], 
+                                   str(pool_info['vip']['vlan_tag']), 
+                                   pool_info['vip']['self_ip'][0])
+            # Release the VLAN 
+            self.free_vlan(pool_info['vip']['vlan_tag'])
 
-        # delete the IFL
-        self._api.logical_interface_delete(id=pool_info['vip'][u'mx_ifl'])
+            # delete the IFL
+            self._api.logical_interface_delete(id=ifl_uuid)
 
-        # delete the VMI
-        vmi = VirtualMachineInterfaceSM.get(pool_info['vip'][u'self_ip'][2])
-        self._api.instance_ip_delete(id=vmi.instance_ip)
-        self._api.virtual_machine_interface_delete(id=pool_info['vip'][u'self_ip'][2])
-
-        for snat_ip in pool_info['vip']['snat_vmi'].keys() or []:
-            vmi = VirtualMachineInterfaceSM.get(pool_info['vip']['snat_vmi'][snat_ip][1])
+            # delete the VMI
+            vmi = VirtualMachineInterfaceSM.get(pool_info['vip'][u'self_ip'][2])
             self._api.instance_ip_delete(id=vmi.instance_ip)
-            self._api.virtual_machine_interface_delete(id=pool_info['vip']['snat_vmi'][snat_ip][1])
+            self._api.virtual_machine_interface_delete(id=pool_info['vip'][u'self_ip'][2])
+            del(self.ifl_list[ifl_uuid])
+
+        subnet_id = pool_info[u'vip'][u'subnet']
+        if subnet_id not in self.subnet_snat_list:
+            return
+        self.subnet_snat_list[subnet_id]['id'].remove(pool_info['vip']['id'])
+        if not len(self.subnet_snat_list[subnet_id]['id']):
+            del(self.subnet_snat_list[subnet_id])
+            for snat_ip in pool_info['vip']['snat_vmi'].keys() or []:
+                vmi = VirtualMachineInterfaceSM.get(pool_info['vip']['snat_vmi'][snat_ip][1])
+                self._api.instance_ip_delete(id=vmi.instance_ip)
+                self._api.virtual_machine_interface_delete(id=pool_info['vip']['snat_vmi'][snat_ip][1])
+                bigips = self.__bigips.values()
+                for set_bigip in bigips:
+                    self.delete_snat(set_bigip, pool_info['tenant_id'], pool_info['tenant_id'], 
+                             pool_info['vip']['snat_vmi'][snat_ip][0])
     # end release_vip_resource
 
     def release_resource(self, pool_info):
         self.release_vip_resource(pool_info)
         self.release_pool_resource(pool_info)
+        if pool_info['tenant_id'] not in self.project_list:
+            return
+        self.project_list[pool_info['tenant_id']].remove(pool_info['id'])
+        if not len(self.project_list[pool_info['tenant_id']]):
+            bigips = self.__bigips.values()
+            for bigip in bigips:
+		bigip.arp.delete_all(folder=pool_info['tenant_id'])
+                bigip.route.delete_domain(folder=pool_info['tenant_id'])
+                bigip.system.delete_folder(
+                            folder=bigip.decorate_folder(pool_info['tenant_id']))
+            del(self.project_list[pool_info['tenant_id']])
     # end release_resource
 
     def locate_resources(self, pool, add_change=True):
@@ -577,6 +621,11 @@ class OpencontrailF5LoadbalancerDriver(
         new_pool_info = {}
 
         pool_obj = self._get_pool(pool)
+
+        if pool_obj.parent_uuid not in self.project_list:
+            self.project_list[pool_obj.parent_uuid] = set()
+        self.project_list[pool_obj.parent_uuid].add(pool_obj.uuid)
+
         pool_subnet_id = pool_obj.params['subnet_id']
         pool_subnet_cidr = utils.get_subnet_cidr(self._api, pool_subnet_id)
         pool_net_id = utils.get_subnet_network_id(self._api, pool_subnet_id)
@@ -584,8 +633,12 @@ class OpencontrailF5LoadbalancerDriver(
         new_members = {}
         for member in pool_obj.members or []:
             member_obj = LoadbalancerMemberSM.get(member)
+            if not member_obj:
+                return (None, None)
             new_members[member] = member_obj.params
         vip_obj = self._get_vip(pool_obj.virtual_ip)
+        if not vip_obj:
+            return (None, None)
         vip_subnet_id = vip_obj.params['subnet_id']
         vip_subnet_cidr = utils.get_subnet_cidr(self._api, vip_subnet_id)
         vip_net_id = utils.get_subnet_network_id(self._api, vip_subnet_id)
@@ -613,6 +666,7 @@ class OpencontrailF5LoadbalancerDriver(
         vip_info[u'network_id'] = vip_net_id
         vip_info[u'params'] = vip_obj.params
 
+        ifl_uuid = None
         if pool_in_db is None:
             # Locate the IFL for pool
             ifl = self.find_ifl(self.mx_physical_router, pool_network_obj)
@@ -635,19 +689,40 @@ class OpencontrailF5LoadbalancerDriver(
             new_pool_info[u'vlan_tag'] = ifl.logical_interface_vlan_tag
             new_pool_info[u'self_ip'] = (vmi.name, ports_created.keys()[0], ports_created.values()[0].uuid)
 
+            ifl_uuid = ifl.uuid
             if self.use_snat:
-                # Allocate VMI for SNAT for client initiated traffic
-                name = 'snat_' + pool + '_' + pool_obj.virtual_ip + '_' + pool_subnet_id
-                ports_created = self._create_port(pool_obj.parent_uuid, pool_subnet_id, name, self.num_snat)
-                pool_snat_list = {}
-                for port in ports_created.keys() or []:
-                    pool_snat_list[port] = (ports_created[port].name, ports_created[port].uuid)
+                if pool_subnet_id not in self.subnet_snat_list:
+                    # Allocate VMI for SNAT for client initiated traffic
+                    name = 'snat_' + pool + '_' + pool_obj.virtual_ip + '_' + pool_subnet_id
+                    ports_created = self._create_port(pool_obj.parent_uuid, pool_subnet_id, name, self.num_snat)
+                    pool_snat_list = {}
+                    for port in ports_created.keys() or []:
+                        pool_snat_list[port] = (ports_created[port].name, ports_created[port].uuid)
+                else:
+                    import pdb;pdb.set_trace()
+                    pool_snat_list = {}
+                    for port in self.subnet_snat_list[pool_subnet_id]['vmi_list'] or []:
+                        vmi = VirtualMachineInterfaceSM.get(port)
+                        pool_snat_list[InstanceIpSM.get(vmi.instance_ip).address] = (vmi.name, port)
                 new_pool_info[u'snat_vmi'] = pool_snat_list
         else:
             new_pool_info[u'mx_ifl'] = pool_in_db[u'mx_ifl']
+            ifl_uuid = pool_in_db[u'mx_ifl']
             new_pool_info[u'vlan_tag'] = pool_in_db[u'vlan_tag'] 
             new_pool_info[u'snat_vmi'] = pool_in_db[u'snat_vmi']
             new_pool_info[u'self_ip'] = pool_in_db[u'self_ip']
+
+        if ifl_uuid not in self.ifl_list:
+            self.ifl_list[ifl_uuid] = set()
+        self.ifl_list[ifl_uuid].add(pool)
+
+        if pool_subnet_id not in self.subnet_snat_list:
+            self.subnet_snat_list[pool_subnet_id] = {'vmi_list': set(), 'id' : set()}
+
+        self.subnet_snat_list[pool_subnet_id]['id'].add(pool)
+
+        for snat_ip in new_pool_info['snat_vmi'].keys() or []:
+            self.subnet_snat_list[pool_subnet_id]['vmi_list'].add(new_pool_info['snat_vmi'][snat_ip][1])
 
         if pool_in_db is None or pool_in_db[u'virtual_ip'] != pool_obj.virtual_ip:
             # Locate the IFL for vip
@@ -661,31 +736,53 @@ class OpencontrailF5LoadbalancerDriver(
           
                 # Link the ifl and VMI
                 for port in ports_created.values() or []:
+                    vmi = port
                     ifl.set_virtual_machine_interface(port)
                     self._api.logical_interface_update(ifl)
             else:
                 vmi = VirtualMachineInterfaceSM.get(ifl.virtual_machine_interface)
                 ports_created[InstanceIpSM.get(vmi.instance_ip).address] = vmi
-            vip_info[u'mx_ifl'] = ifl.uuid
+            ifl_uuid = ifl.uuid
+            vip_info[u'mx_ifl'] = ifl_uuid
             vip_info[u'vlan_tag'] = ifl.logical_interface_vlan_tag
             vip_info[u'self_ip'] = (vmi.name, ports_created.keys()[0], ports_created.values()[0].uuid)
-
             if self.use_snat:
-                # Allocate VMI for SNAT for server initiated traffic
-                name = 'snat_' + pool + '_' + pool_obj.virtual_ip + '_' + vip_subnet_id
-                ports_created = self._create_port(pool_obj.parent_uuid, vip_subnet_id, name, self.num_snat)
-                vip_snat_list = {}
-                for port in ports_created.keys() or []:
-                    vip_snat_list[port] = (ports_created[port].name, ports_created[port].uuid)
+                if vip_subnet_id not in self.subnet_snat_list:
+                    # Allocate VMI for SNAT for server initiated traffic
+                    name = 'snat_' + pool + '_' + pool_obj.virtual_ip + '_' + vip_subnet_id
+                    ports_created = self._create_port(pool_obj.parent_uuid, vip_subnet_id, name, self.num_snat)
+                    vip_snat_list = {}
+                    for port in ports_created.keys() or []:
+                        vip_snat_list[port] = (ports_created[port].name, ports_created[port].uuid)
+                else:
+                    import pdb;pdb.set_trace()
+                    vip_snat_list = {}
+                    for port in self.subnet_snat_list[vip_subnet_id]['vmi_list'] or []:
+                        vmi = VirtualMachineInterfaceSM.get(port)
+                        vip_snat_list[InstanceIpSM.get(vmi.instance_ip).address] = (vmi.name, port)
                 vip_info[u'snat_vmi'] = vip_snat_list
         else:
             vip_info[u'mx_ifl'] = pool_in_db[u'vip'][u'mx_ifl']
+            ifl_uuid =  pool_in_db[u'vip'][u'mx_ifl']
             vip_info[u'vlan_tag'] = pool_in_db[u'vip'][u'vlan_tag'] 
             vip_info[u'snat_vmi'] = pool_in_db[u'vip'][u'snat_vmi']
             vip_info[u'self_ip'] = pool_in_db[u'vip'][u'self_ip']
 
-
         new_pool_info[u'vip'] = vip_info
+
+        if ifl_uuid not in self.ifl_list:
+            self.ifl_list[ifl_uuid] = set()
+        self.ifl_list[ifl_uuid].add(vip_obj.uuid)
+
+        if vip_subnet_id not in self.subnet_snat_list:
+            self.subnet_snat_list[vip_subnet_id] = {'vmi_list': set(), 'id' : set()}
+
+        self.subnet_snat_list[vip_subnet_id]['id'].add(vip_obj.uuid)
+
+        for snat_ip in new_pool_info['vip']['snat_vmi'].keys() or []:
+            self.subnet_snat_list[vip_subnet_id]['vmi_list'].add(
+                           new_pool_info['vip']['snat_vmi'][snat_ip][1])
+
         return (pool_in_db, new_pool_info)
     # end locate_resources
 
@@ -784,7 +881,7 @@ class OpencontrailF5LoadbalancerDriver(
             else:
                 old_pool_svc, new_pool_svc = self.locate_resources(pool['id'], False)
             if old_pool_svc is None and new_pool_svc is None:
-                pass
+                return
             elif old_pool_svc is None:
                 self.create_service(new_pool_svc)
             elif new_pool_svc is None:
