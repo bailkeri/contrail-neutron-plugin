@@ -26,6 +26,8 @@ from svc_monitor.config_db import *
 
 LOG = logging.getLogger(__name__)
 
+APP_COOKIE_RULE_PREFIX = 'app_cookie_'
+RPS_THROTTLE_RULE_PREFIX = 'rps_throttle_'
 
 class OpencontrailF5LoadbalancerDriver(
         abstract_driver.LoadBalancerAbstractDriver):
@@ -239,6 +241,44 @@ class OpencontrailF5LoadbalancerDriver(
                     self.create_vip_service(bigip, new_pool_info)
                     update_pool_info['remove_vip'] = old_pool_info['vip']
 
+                if key == 'health_monitors':
+                    added_hms = set(new_pool_info[key].keys()) - set(old_pool_info[key].keys())
+                    removed_hms = set(old_pool_info[key].keys()) - set(new_pool_info[key].keys())
+                    common_hms = set(old_pool_info[key].keys()) & set(new_pool_info[key].keys())
+                    if len(added_hms):
+                        for hm in added_hms:
+                            timeout = int(new_pool_info['health_monitors'][hm]['max_retries']) * int(new_pool_info['health_monitors'][hm]['timeout'])
+                            bigip.monitor.create(name=hm,
+                                                 mon_type=new_pool_info['health_monitors'][hm]['monitor_type'],
+                                                 interval=new_pool_info['health_monitors'][hm]['delay'],
+                                                 timeout=timeout,
+                                                 send_text=None,
+                                                 recv_text=None,
+                                                 folder=new_pool_info['tenant_id'])
+                            self._update_monitor(bigip, new_pool_info['tenant_id'], hm, 
+                                                 new_pool_info['health_monitors'][hm], set_times=False)
+
+                            bigip.pool.add_monitor(name=new_pool_info['id'], monitor_name=hm,
+                                                   folder=new_pool_info['tenant_id'])
+
+                    if len(removed_hms):
+                        for hm in removed_hms:
+                            bigip.pool.remove_monitor(name=new_pool_info['id'], monitor_name=hm,
+                                                   folder=new_pool_info['tenant_id'])
+                            try:
+                                bigip.monitor.delete(name=hm,
+                                                     mon_type=old_pool_info['health_monitors'][hm]['monitor_type'],
+                                                     folder=new_pool_info['tenant_id'])
+                            except:
+                                pass
+ 
+                    if len(common_hms):
+                        for hm in common_hms:
+                            if new_pool_info['health_monitors'][hm] == old_pool_info['health_monitors'][hm]:
+                                continue
+                            self._update_monitor(bigip, new_pool_info['tenant_id'], hm, 
+                                                 new_pool_info['health_monitors'][hm], set_times=True)
+
                 if key == 'members':
                     added_members = set(new_pool_info[key].keys()) - set(old_pool_info[key].keys())
                     removed_members = set(old_pool_info[key].keys()) - set(new_pool_info[key].keys())
@@ -300,6 +340,8 @@ class OpencontrailF5LoadbalancerDriver(
                                 bigip_vs = bigip.virtual_server
                                 if vip_key == 'params':
                                     for vip_property in new_pool_info['vip'][vip_key].keys():
+                                        if new_pool_info['vip']['params'][vip_property] == old_pool_info['vip']['params'][vip_property]:
+                                            continue
                                         # Update the vip params
                                         if vip_property == 'admin_state':
                                             if new_pool_info['vip']['params']['admin_state']:
@@ -308,6 +350,12 @@ class OpencontrailF5LoadbalancerDriver(
                                             else:
                                                 bigip_vs.disable_virtual_server(name=new_pool_info['virtual_ip'],
                                                                         folder=new_pool_info['tenant_id'])
+                                        elif vip_property == 'connection_limit':
+                                            self._update_connection_limit(bigip, new_pool_info)
+                                        elif vip_property == 'persistence_type':
+                                            self._update_session_persistance(bigip, new_pool_info)
+                                        elif vip_property == 'persistence_cookie_name':
+                                            self._update_session_persistance(bigip, new_pool_info)
 
                                 if vip_key == 'description' or vip_key == 'name':
                                     # Update the vip description
@@ -364,6 +412,57 @@ class OpencontrailF5LoadbalancerDriver(
                                   folder=tenant_id)
     # end delete_members
 
+    def _create_app_cookie_persist_rule(self, cookiename):
+        rule_text = "when HTTP_REQUEST {\n"
+        rule_text += " if { [HTTP::cookie " + str(cookiename)
+        rule_text += "] ne \"\" }{\n"
+        rule_text += "     persist uie [string tolower [HTTP::cookie \""
+        rule_text += cookiename + "\"]] 3600\n"
+        rule_text += " }\n"
+        rule_text += "}\n\n"
+        rule_text += "when HTTP_RESPONSE {\n"
+        rule_text += " if { [HTTP::cookie \"" + str(cookiename)
+        rule_text += "\"] ne \"\" }{\n"
+        rule_text += "     persist add uie [string tolower [HTTP::cookie \""
+        rule_text += cookiename + "\"]] 3600\n"
+        rule_text += " }\n"
+        rule_text += "}\n\n"
+        return rule_text
+    # end _create_app_cookie_persist_rule
+
+    def _create_http_rps_throttle_rule(self, req_limit):
+        rule_text = "when HTTP_REQUEST {\n"
+        rule_text += " set expiration_time 300\n"
+        rule_text += " set client_ip [IP::client_addr]\n"
+        rule_text += " set req_limit " + str(req_limit) + "\n"
+        rule_text += " set curr_time [clock seconds]\n"
+        rule_text += " set timekey starttime\n"
+        rule_text += " set reqkey reqcount\n"
+        rule_text += " set request_count [session lookup uie $reqkey]\n"
+        rule_text += " if { $request_count eq \"\" } {\n"
+        rule_text += "   set request_count 1\n"
+        rule_text += "   session add uie $reqkey $request_count "
+        rule_text += "$expiration_time\n"
+        rule_text += "   session add uie $timekey [expr {$curr_time - 2}]"
+        rule_text += "[expr {$expiration_time + 2}]\n"
+        rule_text += " } else {\n"
+        rule_text += "   set start_time [session lookup uie $timekey]\n"
+        rule_text += "   incr request_count\n"
+        rule_text += "   session add uie $reqkey $request_count"
+        rule_text += "$expiration_time\n"
+        rule_text += "   set elapsed_time [expr {$curr_time - $start_time}]\n"
+        rule_text += "   if {$elapsed_time < 60} {\n"
+        rule_text += "     set elapsed_time 60\n"
+        rule_text += "   }\n"
+        rule_text += "   set curr_rate [expr {$request_count /"
+        rule_text += "($elapsed_time/60)}]\n"
+        rule_text += "   if {$curr_rate > $req_limit}{\n"
+        rule_text += "     HTTP::respond 503 throttled \"Retry-After\" 60\n"
+        rule_text += "   }\n"
+        rule_text += " }\n"
+        rule_text += "}\n"
+        return rule_text
+    # end _create_http_rps_throttle_rule
     def create_vip_service(self, bigip, pool_info):
         # Create VLAN and self ip for VIP subnet/network
         self.create_vlan_interface(bigip, pool_info['id'], pool_info['tenant_id'],
@@ -410,7 +509,123 @@ class OpencontrailF5LoadbalancerDriver(
             bigip_vs.disable_virtual_server(name=pool_info['virtual_ip'],
                                     folder=pool_info['tenant_id'])
 
+        self._update_session_persistance(bigip, pool_info)
+
+        self._update_connection_limit(bigip, pool_info)
     # end create_vip_service
+
+
+    def _update_session_persistance(self, bigip, pool_info):
+        bigip_vs = bigip.virtual_server
+        if pool_info['vip']['params']['persistence_type']:
+            # branch on persistence type
+            persistence_type = pool_info['vip']['params']['persistence_type']
+            if persistence_type == 'SOURCE_IP':
+                # add source_addr persistence profile
+                bigip_vs.set_persist_profile(name=pool_info['virtual_ip'],
+                    profile_name='/Common/source_addr',
+                    folder=pool_info['tenant_id'])
+            elif persistence_type == 'HTTP_COOKIE':
+                # HTTP cookie persistence requires an HTTP profile
+                bigip_vs.add_profile(name=pool_info['virtual_ip'],
+                    profile_name='/Common/http',
+                    folder=pool_info['tenant_id'])
+                # add standard cookie persistence profile
+                bigip_vs.set_persist_profile(
+                    name=pool_info['virtual_ip'],
+                    profile_name='/Common/cookie',
+                    folder=pool_info['tenant_id'])
+                if pool_info['params']['loadbalancer_method'] == 'SOURCE_IP':
+                    bigip_vs.set_fallback_persist_profile(
+                                    name=pool_info['virtual_ip'],
+                                    profile_name='/Common/source_addr',
+                                    folder=pool_info['tenant_id'])
+            elif persistence_type == 'APP_COOKIE':
+                # application cookie persistence requires
+                # an HTTP profile
+                bigip_vs.add_profile(name=pool_info['virtual_ip'],
+                                profile_name='/Common/http',
+                                folder=pool_info['tenant_id'])
+                # make sure they gave us a cookie_name
+                if pool_info['vip']['params']['persistence_cookie_name']: 
+                    cookie_name = pool_info['vip']['params']['persistence_cookie_name']
+                    # create and add irule to capture cookie
+                    # from the service response.
+                    rule_definition = self._create_app_cookie_persist_rule(cookie_name)
+                    # try to create the irule
+                    if bigip.rule.create(name=APP_COOKIE_RULE_PREFIX + pool_info['virtual_ip'],
+                            rule_definition=rule_definition,
+                            folder=pool_info['tenant_id']):
+                        # create universal persistence profile
+                        bigip_vs.create_uie_profile(name=APP_COOKIE_RULE_PREFIX + pool_info['virtual_ip'],
+                                        rule_name=APP_COOKIE_RULE_PREFIX + pool_info['virtual_ip'],
+                                        folder=pool_info['tenant_id'])
+                    # set persistence profile
+                    bigip_vs.set_persist_profile(name=pool_info['virtual_ip'],
+                        profile_name=APP_COOKIE_RULE_PREFIX + pool_info['virtual_ip'],
+                        folder=pool_info['tenant_id'])
+                    if pool_info['params']['loadbalancer_method'] == 'SOURCE_IP':
+                        bigip_vs.set_fallback_persist_profile(name=pool_info['virtual_ip'],
+                            profile_name='/Common/source_addr', folder=pool_info['tenant_id'])
+                else:
+                    # if they did not supply a cookie_name
+                    # just default to regualar cookie peristence
+                    bigip_vs.set_persist_profile(name=pool_info['virtual_ip'],
+                        profile_name='/Common/cookie',
+                        folder=pool_info['tenant_id'])
+                    if pool_info['params']['loadbalancer_method'] == 'SOURCE_IP':
+                        bigip_vs.set_fallback_persist_profile(name=pool_info['virtual_ip'],
+                            profile_name='/Common/source_addr', folder=pool_info['tenant_id'])
+        else:
+            bigip_vs.remove_all_persist_profiles(name=pool_info['virtual_ip'], 
+                    folder=pool_info['tenant_id'])
+    # end _update_session_persistance
+
+    def _update_connection_limit(self, bigip, pool_info):
+        bigip_vs = bigip.virtual_server
+        rule_name = 'http_throttle_' + pool_info['virtual_ip']
+
+        if pool_info['vip']['params']['connection_limit'] > 0:
+            # spec says you need to do this for HTTP
+            # and HTTPS, but unless you can decrypt
+            # you can't measure HTTP rps for HTTPs... Duh..
+            if pool_info['vip']['params']['protocol'] == 'HTTP':
+                # add an http profile
+                bigip_vs.add_profile(name=pool_info['virtual_ip'],
+                    profile_name='/Common/http',
+                    folder=pool_info['tenant_id'])
+                # create the rps irule
+                rule_definition = self._create_http_rps_throttle_rule(pool_info['vip']['params']['connection_limit'])
+                # try to create the irule
+                bigip.rule.create(name=RPS_THROTTLE_RULE_PREFIX +
+                                  pool_info['virtual_ip'],
+                                  rule_definition=rule_definition,
+                                  folder=pool_info['tenant_id'])
+                # for the rule text to update becuase
+                # connection limit may have changed
+                bigip.rule.update(name=RPS_THROTTLE_RULE_PREFIX +
+                                  pool_info['virtual_ip'],
+                                  rule_definition=rule_definition,
+                                  folder=pool_info['tenant_id'])
+                            # add the throttle to the vip
+                bigip_vs.add_rule(name=pool_info['virtual_ip'],
+                                  rule_name=RPS_THROTTLE_RULE_PREFIX + pool_info['virtual_ip'],
+                                  priority=500, folder=pool_info['tenant_id'])
+            else:
+                # if not HTTP.. use connection limits
+                bigip_vs.set_connection_limit(name=pool_info['virtual_ip'],
+                    connection_limit=int(pool_info['vip']['params']['connection_limit']),
+                    folder=pool_info['tenant_id'])
+        else:
+            # clear throttle rule
+            bigip_vs.remove_rule(name=RPS_THROTTLE_RULE_PREFIX + pool_info['virtual_ip'],
+                                 rule_name=rule_name, priority=500,
+                                 folder=pool_info['tenant_id'])
+            # clear the connection limits
+            bigip_vs.set_connection_limit(name=pool_info['virtual_ip'],
+                            connection_limit=0,
+                            folder=pool_info['tenant_id'])
+    # end _update_connection_limit
 
     def delete_vip_service(self, bigip, pool_info):
         # Delete VIP related config
@@ -421,6 +636,18 @@ class OpencontrailF5LoadbalancerDriver(
     def delete_service_on_device(self, bigip, pool_info):
         # Delete VIP related config
         self.delete_vip_service(bigip, pool_info)
+
+        # Delete health monitors
+        for health_monitor in pool_info['health_monitors'].keys() or []:
+            bigip.pool.remove_monitor(name=pool_info['id'], monitor_name=health_monitor,
+                                   folder=pool_info['tenant_id'])
+            # not sure if the monitor might be in use
+            try:
+                bigip.monitor.delete(name=health_monitor,
+                                     mon_type=pool_info['health_monitors'][health_monitor]['monitor_type'],
+                                     folder=pool_info['tenant_id'])
+            except:
+                pass
 
         # Delete the Pool config
         bigip.pool.delete(name=pool_info['id'],
@@ -514,7 +741,84 @@ class OpencontrailF5LoadbalancerDriver(
 
         # create vip and and related objects
         self.create_vip_service(bigip, pool_info)
+
+        # Create health monitors
+        for health_monitor in pool_info['health_monitors'].keys() or []:
+            timeout = int(pool_info['health_monitors'][health_monitor]['max_retries']) * int(pool_info['health_monitors'][health_monitor]['timeout'])
+            bigip.monitor.create(name=health_monitor,
+                                 mon_type=pool_info['health_monitors'][health_monitor]['monitor_type'],
+                                 interval=pool_info['health_monitors'][health_monitor]['delay'],
+                                 timeout=timeout,
+                                 send_text=None,
+                                 recv_text=None,
+                                 folder=pool_info['tenant_id'])
+            self._update_monitor(bigip, pool_info['tenant_id'], health_monitor, 
+                                 pool_info['health_monitors'][health_monitor], set_times=False)
+
+            bigip.pool.add_monitor(name=pool_info['id'], monitor_name=health_monitor,
+                                   folder=pool_info['tenant_id'])
     # end create_service_on_device
+
+    def _update_monitor(self, bigip, folder, monitor_id, monitor_data, set_times=True):
+        if set_times:
+            timeout = int(monitor_data['max_retries']) * int(monitor_data['timeout'])
+            # make sure monitor attributes are correct
+            bigip.monitor.set_interval(name=monitor_id,
+                               mon_type=monitor_data['monitor_type'],
+                               interval=monitor_data['delay'],
+                               folder=folder)
+            bigip.monitor.set_timeout(name=monitor_id,
+                              mon_type=monitor_data['monitor_type'],
+                              timeout=timeout,
+                              folder=folder)
+
+        if monitor_data['monitor_type'] == 'HTTP' or monitor_data['monitor_type'] == 'HTTPS':
+            if 'url_path' in monitor_data:
+                send_text = "GET " + monitor_data['url_path'] + \
+                                                " HTTP/1.0\\r\\n\\r\\n"
+            else:
+                send_text = "GET / HTTP/1.0\\r\\n\\r\\n"
+
+            if 'expected_codes' in monitor_data:
+                try:
+                    if monitor_data['expected_codes'].find(",") > 0:
+                        status_codes = \
+                            monitor_data['expected_codes'].split(',')
+                        recv_text = "HTTP/1\.(0|1) ("
+                        for status in status_codes:
+                            int(status)
+                            recv_text += status + "|"
+                        recv_text = recv_text[:-1]
+                        recv_text += ")"
+                    elif monitor_data['expected_codes'].find("-") > 0:
+                        status_range = \
+                            monitor_data['expected_codes'].split('-')
+                        start_range = status_range[0]
+                        int(start_range)
+                        stop_range = status_range[1]
+                        int(stop_range)
+                        recv_text = \
+                            "HTTP/1\.(0|1) [" + \
+                            start_range + "-" + \
+                            stop_range + "]"
+                    else:
+                        int(monitor_data['expected_codes'])
+                        recv_text = "HTTP/1\.(0|1) " + \
+                                    monitor_data['expected_codes']
+                except:
+                    recv_text = "HTTP/1\.(0|1) 200"
+            else:
+                recv_text = "HTTP/1\.(0|1) 200"
+
+            bigip.monitor.set_send_string(name=monitor_id,
+                                          mon_type=monitor_data['monitor_type'],
+                                          send_text=send_text,
+                                          folder=folder)
+            bigip.monitor.set_recv_string(name=monitor_id,
+                                          mon_type=monitor_data['monitor_type'],
+                                          recv_text=recv_text,
+                                          folder=folder)
+    # end _update_monitor
 
     def release_pool_resource(self, pool_info):
         ifl_uuid = pool_info[u'mx_ifl']
@@ -657,6 +961,15 @@ class OpencontrailF5LoadbalancerDriver(
 
         new_pool_info[u'members'] = new_members
 
+        hms = {}
+        for hm in pool_obj.loadbalancer_healthmonitors or []:
+            hm_obj = HealthMonitorSM.get(hm)
+            if not hm_obj:
+                return (None, None)
+            hms[hm] = hm_obj.params
+
+        new_pool_info[u'health_monitors'] = hms
+
         vip_info = {}
         vip_info[u'name'] = vip_obj.name
         vip_info[u'id'] = vip_obj.uuid
@@ -699,7 +1012,6 @@ class OpencontrailF5LoadbalancerDriver(
                     for port in ports_created.keys() or []:
                         pool_snat_list[port] = (ports_created[port].name, ports_created[port].uuid)
                 else:
-                    import pdb;pdb.set_trace()
                     pool_snat_list = {}
                     for port in self.subnet_snat_list[pool_subnet_id]['vmi_list'] or []:
                         vmi = VirtualMachineInterfaceSM.get(port)
@@ -755,7 +1067,6 @@ class OpencontrailF5LoadbalancerDriver(
                     for port in ports_created.keys() or []:
                         vip_snat_list[port] = (ports_created[port].name, ports_created[port].uuid)
                 else:
-                    import pdb;pdb.set_trace()
                     vip_snat_list = {}
                     for port in self.subnet_snat_list[vip_subnet_id]['vmi_list'] or []:
                         vmi = VirtualMachineInterfaceSM.get(port)
@@ -963,6 +1274,9 @@ class OpencontrailF5LoadbalancerDriver(
         pass
     # end  delete_pool_health_monitor
 
-    def update_health_monitor(self, context, id, health_monitor):
+    def update_health_monitor(self, context,
+                              old_health_monitor,
+                              health_monitor,
+                              pool_id):
         pass
     # end  update_health_monitor
