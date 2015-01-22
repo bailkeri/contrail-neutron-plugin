@@ -43,6 +43,7 @@ class OpencontrailF5LoadbalancerDriver(
         f5opts = {
             'device_ip': '127.0.0.1',
             'sync_mode': 'replication',
+            'global_routed_mode': 'True',
             'ha_mode': 'standalone',
             'use_snat': 'True',
             'num_snat': '1',
@@ -56,6 +57,7 @@ class OpencontrailF5LoadbalancerDriver(
 
         f5opts.update(dict(config_section.items("F5")))
         self.device_ip = f5opts.get('device_ip')
+        self.global_routed_mode = f5opts.get('global_routed_mode')
         self.sync_mode = f5opts.get('sync_mode')
         self.ha_mode = f5opts.get('ha_mode')
         self.use_snat = f5opts.get('use_snat')
@@ -174,6 +176,7 @@ class OpencontrailF5LoadbalancerDriver(
                 for set_bigip in bigips:
                     set_bigip.group_bigips = bigips
                     set_bigip.sync_mode = self.sync_mode
+                    set_bigip.global_routed_mode = self.global_routed_mode
                     set_bigip.assured_networks = []
                     set_bigip.assured_snat_subnets = []
                     set_bigip.assured_gateway_subnets = []
@@ -285,32 +288,38 @@ class OpencontrailF5LoadbalancerDriver(
                     common_members = set(old_pool_info[key].keys()) & set(new_pool_info[key].keys())
                     if len(added_members):
                         for member in added_members:
+                            ip_address=new_pool_info['members'][member]['address']
+                            if self.global_routed_mode:
+                                ip_address=ip_address + "%0"
                             # Add the new members
                             result = bigip.pool.add_member(
                                                   name=new_pool_info['id'],
-                                                  ip_address=new_pool_info['members'][member]['address'],
+                                                  ip_address=ip_address,
                                                   port=int(new_pool_info['members'][member]['protocol_port']),
                                                   folder=new_pool_info['tenant_id'],
                                                   no_checks=True)
                             # check admin state
                             if new_pool_info['members'][member]['admin_state']:
                                 bigip.pool.enable_member(name=new_pool_info['id'],
-                                                    ip_address=new_pool_info['members'][member]['address'],
+                                                    ip_address=ip_address,
                                                     port=int(new_pool_info['members'][member]['protocol_port']),
                                                     folder=new_pool_info['tenant_id'],
                                                     no_checks=True)
                             else:
                                 bigip.pool.disable_member(name=new_pool_info['id'],
-                                                    ip_address=new_pool_info['members'][member]['address'],
+                                                    ip_address=ip_address,
                                                     port=int(new_pool_info['members'][member]['protocol_port']),
                                                     folder=new_pool_info['tenant_id'],
                                                     no_checks=True)
 
                     if len(removed_members):
                         for member in removed_members:
+                            ip_address=old_pool_info['members'][member]['address']
+                            if self.global_routed_mode:
+                                ip_address = ip_address + "%0"
                             # Remove the members
                             bigip.pool.remove_member(name=new_pool_info['id'],
-                                  ip_address=old_pool_info['members'][member]['address'],
+                                  ip_address=ip_address,
                                   port=int(old_pool_info['members'][member]['protocol_port']),
                                   folder=new_pool_info['tenant_id'])
  
@@ -319,16 +328,19 @@ class OpencontrailF5LoadbalancerDriver(
                             # Update the members
                             for member_property in new_pool_info['members'][member].keys():
                                 if member_property == 'admin_state':
+                                    ip_address = new_pool_info['members'][member]['address']
+                                    if self.global_routed_mode:
+                                        ip_address = ip_address + "%0"
                                     # check admin state
                                     if new_pool_info['members'][member]['admin_state']:
                                         bigip.pool.enable_member(name=new_pool_info['id'],
-                                                    ip_address=new_pool_info['members'][member]['address'],
+                                                    ip_address=ip_address,
                                                     port=int(new_pool_info['members'][member]['protocol_port']),
                                                     folder=new_pool_info['tenant_id'],
                                                     no_checks=True)
                                     else:
                                         bigip.pool.disable_member(name=new_pool_info['id'],
-                                                    ip_address=new_pool_info['members'][member]['address'],
+                                                    ip_address=ip_address,
                                                     port=int(new_pool_info['members'][member]['protocol_port']),
                                                     folder=new_pool_info['tenant_id'],
                                                     no_checks=True)
@@ -406,8 +418,11 @@ class OpencontrailF5LoadbalancerDriver(
 
     def delete_members(self, bigip, tenant_id, pool_id, member_list):
         for member in member_list['members'].keys() or []:
+            ip_address = member_list['members'][member]['address']
+            if self.global_routed_mode:
+                ip_address = ip_address + "%0"
             bigip.pool.remove_member(name=pool_id,
-                                  ip_address=member_list['members'][member]['address'],
+                                  ip_address=ip_address,
                                   port=int(member_list['members'][member]['protocol_port']),
                                   folder=tenant_id)
     # end delete_members
@@ -464,17 +479,18 @@ class OpencontrailF5LoadbalancerDriver(
         return rule_text
     # end _create_http_rps_throttle_rule
     def create_vip_service(self, bigip, pool_info):
-        # Create VLAN and self ip for VIP subnet/network
-        self.create_vlan_interface(bigip, pool_info['id'], pool_info['tenant_id'],
+        if not self.global_routed_mode:
+            # Create VLAN and self ip for VIP subnet/network
+            self.create_vlan_interface(bigip, pool_info['id'], pool_info['tenant_id'],
                                    str(pool_info['vip']['vlan_tag']),
                                    pool_info['vip']['vlan_tag'],
                                    pool_info['vip']['cidr'],
                                    pool_info['vip']['self_ip'][0],
                                    pool_info['vip']['self_ip'][1])
 
-        # create SNAT for vip subnet
-        for snat_ip in pool_info['vip']['snat_vmi'].keys() or []:
-            self.create_snat(bigip, pool_info['tenant_id'], pool_info['tenant_id'], 
+            # create SNAT for vip subnet
+            for snat_ip in pool_info['vip']['snat_vmi'].keys() or []:
+                self.create_snat(bigip, pool_info['tenant_id'], pool_info['tenant_id'], 
                              pool_info['vip']['snat_vmi'][snat_ip][0], snat_ip)
 
 
@@ -482,15 +498,23 @@ class OpencontrailF5LoadbalancerDriver(
                                     pool_info['tenant_id'],
                                     pool_info['tenant_id'])
         ip_address = pool_info['vip']['params']['address']
+        if self.global_routed_mode:
+            ip_address = ip_address + "%0"
+            vlan_name = None
+            use_snat = False
+            snat_pool_name = None
+        else:
+            vlan_name = str(pool_info['vip']['vlan_tag'])
+            use_snat = self.use_snat
         bigip_vs = bigip.virtual_server
         bigip_vs.create(name=pool_info['virtual_ip'],
                         ip_address=ip_address,
                         mask='255.255.255.255',
                         port=int(pool_info['vip']['params']['protocol_port']),
                         protocol=pool_info['vip']['params']['protocol'],
-                        vlan_name=str(pool_info['vip']['vlan_tag']),
+                        vlan_name=vlan_name,
                         traffic_group='/Common/traffic-group-1',
-                        use_snat=self.use_snat,
+                        use_snat=use_snat,
                         snat_pool=snat_pool_name,
                         folder=pool_info['tenant_id'],
                         preserve_vlan_name=False)
@@ -698,17 +722,17 @@ class OpencontrailF5LoadbalancerDriver(
     # end delete_snat
 
     def create_service_on_device(self, bigip, pool_info):
-        # create IRB for pool subnet
-        self.create_vlan_interface(bigip, pool_info['id'], pool_info['tenant_id'],
+        if not self.global_routed_mode:
+            # create IRB for pool subnet
+            self.create_vlan_interface(bigip, pool_info['id'], pool_info['tenant_id'],
                                    str(pool_info['vlan_tag']), 
                                    pool_info['vlan_tag'], 
                                    pool_info['cidr'],
                                    pool_info['self_ip'][0],
                                    pool_info['self_ip'][1])
-
-        # create SNAT for pool subnet
-        for snat_ip in pool_info['snat_vmi'].keys() or []:
-            self.create_snat(bigip, pool_info['tenant_id'], pool_info['tenant_id'], 
+            # create SNAT for pool subnet
+            for snat_ip in pool_info['snat_vmi'].keys() or []:
+                self.create_snat(bigip, pool_info['tenant_id'], pool_info['tenant_id'], 
                              pool_info['snat_vmi'][snat_ip][0], snat_ip)
 
        # create pool on device
@@ -719,22 +743,25 @@ class OpencontrailF5LoadbalancerDriver(
                           folder=pool_info['tenant_id'])
 
         for member in pool_info['members'].keys() or []:
+            ip_address=pool_info['members'][member]['address']
+            if self.global_routed_mode:
+                ip_address= ip_address + "%0"
             result = bigip.pool.add_member(
                                   name=pool_info['id'],
-                                  ip_address=pool_info['members'][member]['address'],
+                                  ip_address=ip_address,
                                   port=int(pool_info['members'][member]['protocol_port']),
                                   folder=pool_info['tenant_id'],
                                   no_checks=True)
             # check admin state
             if pool_info['members'][member]['admin_state']:
                 bigip.pool.enable_member(name=pool_info['id'],
-                                    ip_address=pool_info['members'][member]['address'],
+                                    ip_address=ip_address,
                                     port=int(pool_info['members'][member]['protocol_port']),
                                     folder=pool_info['tenant_id'],
                                     no_checks=True)
             else:
                 bigip.pool.disable_member(name=pool_info['id'],
-                                    ip_address=pool_info['members'][member]['address'],
+                                    ip_address=ip_address,
                                     port=int(pool_info['members'][member]['protocol_port']),
                                     folder=pool_info['tenant_id'],
                                     no_checks=True)
@@ -821,6 +848,8 @@ class OpencontrailF5LoadbalancerDriver(
     # end _update_monitor
 
     def release_pool_resource(self, pool_info):
+        if self.global_routed_mode:
+            return
         ifl_uuid = pool_info[u'mx_ifl']
         if ifl_uuid not in self.ifl_list:
             return
@@ -862,6 +891,8 @@ class OpencontrailF5LoadbalancerDriver(
     # end release_pool_resource
 
     def release_vip_resource(self, pool_info):
+        if self.global_routed_mode:
+            return
         ifl_uuid = pool_info['vip'][u'mx_ifl']
         if ifl_uuid not in self.ifl_list:
             return
@@ -979,6 +1010,9 @@ class OpencontrailF5LoadbalancerDriver(
         vip_info[u'network_id'] = vip_net_id
         vip_info[u'params'] = vip_obj.params
 
+        if self.global_routed_mode:
+            new_pool_info[u'vip'] = vip_info
+            return (pool_in_db, new_pool_info)
         ifl_uuid = None
         if pool_in_db is None:
             # Locate the IFL for pool
